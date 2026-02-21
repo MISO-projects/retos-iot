@@ -23,7 +23,8 @@ from random import randint
 from .models import City, Country, Data, Location, Measurement, Role, State, Station, User
 from realtimeMonitoring import settings
 import dateutil.relativedelta
-from django.db.models import Avg, Max, Min, Sum
+from django.db.models import Avg, Max, Min, Sum, F, Value, Case, When, Window
+from django.db.models.functions import TruncHour, TruncDay, ExtractHour
 
 
 class DashboardView(TemplateView):
@@ -648,6 +649,386 @@ def get_daterange(request):
         start = datetime.fromtimestamp(0)
 
     return start, end
+
+
+"""
+=============================================================================
+API ENDPOINTS FOR PERFORMANCE COMPARISON
+=============================================================================
+"""
+
+
+def get_rollups(request, **kwargs):
+    """
+    Hourly/Daily rollups - Aggregate data into time buckets.
+    Query params: ?interval=hour|day&from=timestamp&to=timestamp
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    interval = request.GET.get("interval", "hour")
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    
+    trunc_func = TruncHour if interval == "hour" else TruncDay
+    
+    rollups = Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    ).annotate(
+        bucket=trunc_func('time')
+    ).values('bucket').annotate(
+        avg_val=Avg('value'),
+        min_val=Min('value'),
+        max_val=Max('value'),
+        count=Count('value')
+    ).order_by('bucket')
+    
+    data = [{
+        'bucket': r['bucket'].isoformat() if r['bucket'] else None,
+        'avg': round(r['avg_val'], 2) if r['avg_val'] else 0,
+        'min': r['min_val'] if r['min_val'] else 0,
+        'max': r['max_val'] if r['max_val'] else 0,
+        'count': r['count']
+    } for r in rollups]
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "rollups",
+        "measure": selected_measure.name,
+        "interval": interval,
+        "execution_time_ms": round(execution_time, 2),
+        "count": len(data),
+        "data": data
+    })
+
+
+def get_daily_extremes(request, **kwargs):
+    """
+    Min/Max temperature of the day with exact timestamp.
+    Returns the hottest and coldest moment for each day.
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    
+    # Get daily max values with timestamps
+    daily_data = Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    ).annotate(
+        day=TruncDay('time')
+    ).values('day').annotate(
+        max_val=Max('value'),
+        min_val=Min('value')
+    ).order_by('day')
+    
+    result = []
+    for day_info in daily_data:
+        day = day_info['day']
+        max_val = day_info['max_val']
+        min_val = day_info['min_val']
+        
+        # Find exact timestamps for max and min
+        max_record = Data.objects.filter(
+            measurement=selected_measure,
+            time__date=day.date(),
+            value=max_val
+        ).first()
+        
+        min_record = Data.objects.filter(
+            measurement=selected_measure,
+            time__date=day.date(),
+            value=min_val
+        ).first()
+        
+        result.append({
+            'day': day.isoformat() if day else None,
+            'max_value': max_val,
+            'max_time': max_record.time.isoformat() if max_record else None,
+            'min_value': min_val,
+            'min_time': min_record.time.isoformat() if min_record else None
+        })
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "daily_extremes",
+        "measure": selected_measure.name,
+        "execution_time_ms": round(execution_time, 2),
+        "count": len(result),
+        "data": result
+    })
+
+
+def get_moving_average(request, **kwargs):
+    """
+    Moving average calculation with configurable window size.
+    Query params: ?window=10&from=timestamp&to=timestamp
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    window_size = int(request.GET.get("window", 10))
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    
+    # Get raw data ordered by time
+    raw_data = list(Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    ).order_by('time').values('time', 'value')[:1000])  # Limit for performance
+    
+    # Calculate moving average in Python
+    data = []
+    for i, record in enumerate(raw_data):
+        window_start = max(0, i - window_size + 1)
+        window_values = [raw_data[j]['value'] for j in range(window_start, i + 1)]
+        moving_avg = sum(window_values) / len(window_values)
+        
+        data.append({
+            'time': record['time'].isoformat(),
+            'value': record['value'],
+            'moving_avg': round(moving_avg, 2)
+        })
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "moving_average",
+        "measure": selected_measure.name,
+        "window_size": window_size,
+        "execution_time_ms": round(execution_time, 2),
+        "count": len(data),
+        "data": data
+    })
+
+
+def get_peak_hours(request, **kwargs):
+    """
+    Peak hours analysis - Find which hours of the day typically have highest/lowest values.
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    
+    hourly_stats = Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    ).annotate(
+        hour=ExtractHour('time')
+    ).values('hour').annotate(
+        avg_val=Avg('value'),
+        min_val=Min('value'),
+        max_val=Max('value'),
+        count=Count('value')
+    ).order_by('hour')
+    
+    data = [{
+        'hour': r['hour'],
+        'avg': round(r['avg_val'], 2) if r['avg_val'] else 0,
+        'min': r['min_val'] if r['min_val'] else 0,
+        'max': r['max_val'] if r['max_val'] else 0,
+        'count': r['count']
+    } for r in hourly_stats]
+    
+    # Find peak and low hours
+    if data:
+        peak_hour = max(data, key=lambda x: x['avg'])
+        low_hour = min(data, key=lambda x: x['avg'])
+    else:
+        peak_hour = low_hour = None
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "peak_hours",
+        "measure": selected_measure.name,
+        "execution_time_ms": round(execution_time, 2),
+        "count": len(data),
+        "peak_hour": peak_hour,
+        "low_hour": low_hour,
+        "data": data
+    })
+
+
+def get_histogram(request, **kwargs):
+    """
+    Histogram distribution - Group values into ranges/buckets.
+    Query params: ?buckets=10&from=timestamp&to=timestamp
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    num_buckets = int(request.GET.get("buckets", 10))
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    
+    # Get min/max to define bucket ranges
+    stats = Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    ).aggregate(
+        min_val=Min('value'),
+        max_val=Max('value')
+    )
+    
+    if stats['min_val'] is None or stats['max_val'] is None:
+        return JsonResponse({
+            "query": "histogram",
+            "measure": selected_measure.name,
+            "execution_time_ms": 0,
+            "count": 0,
+            "data": []
+        })
+    
+    min_val = stats['min_val']
+    max_val = stats['max_val']
+    bucket_size = (max_val - min_val) / num_buckets if max_val != min_val else 1
+    
+    # Get all values and bucket them
+    values = Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    ).values_list('value', flat=True)
+    
+    # Create histogram buckets
+    buckets = {}
+    for i in range(num_buckets):
+        bucket_start = min_val + (i * bucket_size)
+        bucket_end = min_val + ((i + 1) * bucket_size)
+        bucket_label = f"{round(bucket_start, 1)}-{round(bucket_end, 1)}"
+        buckets[bucket_label] = {
+            'range_start': round(bucket_start, 2),
+            'range_end': round(bucket_end, 2),
+            'count': 0
+        }
+    
+    # Count values in each bucket
+    bucket_keys = list(buckets.keys())
+    for value in values:
+        bucket_index = min(int((value - min_val) / bucket_size), num_buckets - 1)
+        if bucket_index >= 0:
+            bucket_label = bucket_keys[bucket_index]
+            buckets[bucket_label]['count'] += 1
+    
+    data = [{'label': k, **v} for k, v in buckets.items()]
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "histogram",
+        "measure": selected_measure.name,
+        "num_buckets": num_buckets,
+        "execution_time_ms": round(execution_time, 2),
+        "total_count": len(values),
+        "data": data
+    })
+
+
+def get_extremes(request, **kwargs):
+    """
+    Extreme values - Top N highest and lowest readings.
+    Query params: ?limit=10&from=timestamp&to=timestamp
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    limit = int(request.GET.get("limit", 10))
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    
+    base_query = Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    )
+    
+    # Get top N highest values
+    highest = base_query.order_by('-value')[:limit]
+    highest_data = [{
+        'time': r.time.isoformat(),
+        'value': r.value,
+        'station_id': r.station_id
+    } for r in highest]
+    
+    # Get top N lowest values
+    lowest = base_query.order_by('value')[:limit]
+    lowest_data = [{
+        'time': r.time.isoformat(),
+        'value': r.value,
+        'station_id': r.station_id
+    } for r in lowest]
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "extremes",
+        "measure": selected_measure.name,
+        "limit": limit,
+        "execution_time_ms": round(execution_time, 2),
+        "highest": highest_data,
+        "lowest": lowest_data
+    })
 
 
 '''

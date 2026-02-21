@@ -39,6 +39,7 @@ from .models import (
 from realtimeMonitoring import settings
 import dateutil.relativedelta
 from django.db.models import Avg, Max, Min, Sum
+from django.db.models.functions import TruncDay
 
 
 class DashboardView(TemplateView):
@@ -676,6 +677,83 @@ class RemaView(TemplateView):
         context["data"] = data
 
         return context
+
+def get_aggregations(request, **kwargs):
+    """
+    Agregaciones temporales - Agrupa datos en intervalos de tiempo (hora/día).
+    Parámetros: ?interval=hour|day&from=timestamp&to=timestamp
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    interval = request.GET.get("interval", "hour")
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    start_ts = int(start.timestamp() * 1000000)
+    end_ts = int(end.timestamp() * 1000000)
+    
+    if interval == "hour":
+        # Los datos ya están agrupados por hora (base_time), se usan los valores precalculados.
+        aggregations = Data.objects.filter(
+            measurement=selected_measure,
+            time__gte=start_ts,
+            time__lte=end_ts
+        ).values('base_time').annotate(
+            avg_val=Avg('avg_value'),
+            min_val=Min('min_value'),
+            max_val=Max('max_value'),
+            total_count=Sum('length')
+        ).order_by('base_time')
+        
+        data = [{
+            'bucket': a['base_time'].isoformat() if a['base_time'] else None,
+            'avg': round(a['avg_val'], 2) if a['avg_val'] else 0,
+            'min': a['min_val'] if a['min_val'] else 0,
+            'max': a['max_val'] if a['max_val'] else 0,
+            'count': a['total_count'] if a['total_count'] else 0
+        } for a in aggregations]
+    else:
+        # Agrupación diaria - agrupa por día usando TruncDay en base_time
+        aggregations = Data.objects.filter(
+            measurement=selected_measure,
+            time__gte=start_ts,
+            time__lte=end_ts
+        ).annotate(
+            day=TruncDay('base_time')
+        ).values('day').annotate(
+            avg_val=Avg('avg_value'),
+            min_val=Min('min_value'),
+            max_val=Max('max_value'),
+            total_count=Sum('length')
+        ).order_by('day')
+        
+        data = [{
+            'bucket': r['day'].isoformat() if r['day'] else None,
+            'avg': round(r['avg_val'], 2) if r['avg_val'] else 0,
+            'min': r['min_val'] if r['min_val'] else 0,
+            'max': r['max_val'] if r['max_val'] else 0,
+            'count': r['total_count'] if r['total_count'] else 0
+        } for r in aggregations]
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "aggregations",
+        "measure": selected_measure.name,
+        "interval": interval,
+        "execution_time_ms": round(execution_time, 2),
+        "count": len(data),
+        "data": data
+    })
+
 
 
 def download_csv_data(request):

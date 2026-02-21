@@ -23,7 +23,8 @@ from random import randint
 from .models import City, Country, Data, Location, Measurement, Role, State, Station, User
 from realtimeMonitoring import settings
 import dateutil.relativedelta
-from django.db.models import Avg, Max, Min, Sum
+from django.db.models import Avg, Max, Min
+from django.db.models.functions import TruncHour, TruncDay
 
 
 class DashboardView(TemplateView):
@@ -585,6 +586,60 @@ def get_map_json(request, **kwargs):
 
     return JsonResponse(data_result)
 
+
+def get_aggregations(request, **kwargs):
+    """
+    Agregaciones temporales - Agrupa datos en intervalos de tiempo (hora/día).
+    Parámetros: ?interval=hour|day&from=timestamp&to=timestamp
+    """
+    start_time = time.time()
+    
+    measure_param = kwargs.get("measure", None)
+    interval = request.GET.get("interval", "hour")
+    measurements = Measurement.objects.all()
+    
+    if measure_param:
+        selected_measure = Measurement.objects.filter(name=measure_param).first()
+    elif measurements.count() > 0:
+        selected_measure = measurements[0]
+    else:
+        return JsonResponse({"error": "No measurements found"}, status=404)
+    
+    start, end = get_daterange(request)
+    
+    trunc_func = TruncHour if interval == "hour" else TruncDay
+    
+    aggregations = Data.objects.filter(
+        measurement=selected_measure,
+        time__gte=start,
+        time__lte=end
+    ).annotate(
+        bucket=trunc_func('time')
+    ).values('bucket').annotate(
+        avg_val=Avg('value'),
+        min_val=Min('value'),
+        max_val=Max('value'),
+        count=Count('value')
+    ).order_by('bucket')
+    
+    data = [{
+        'bucket': a['bucket'].isoformat() if a['bucket'] else None,
+        'avg': round(a['avg_val'], 2) if a['avg_val'] else 0,
+        'min': a['min_val'] if a['min_val'] else 0,
+        'max': a['max_val'] if a['max_val'] else 0,
+        'count': a['count']
+    } for a in aggregations]
+    
+    execution_time = (time.time() - start_time) * 1000
+    
+    return JsonResponse({
+        "query": "aggregations",
+        "measure": selected_measure.name,
+        "interval": interval,
+        "execution_time_ms": round(execution_time, 2),
+        "count": len(data),
+        "data": data
+    })
 
 def download_csv_data(request):
     print("Getting time for csv req")

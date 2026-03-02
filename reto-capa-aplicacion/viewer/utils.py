@@ -64,6 +64,7 @@ def get_last_week_data(user, city, state, country):
             avgVal = sum(reg.avg_value * reg.length for reg in raw_data) / sum(
                 reg.length for reg in raw_data
             )
+            data.sort(key=lambda point: point[0])
             result[measure.name] = {
                 "min": minVal if minVal != None else 0,
                 "max": maxVal if maxVal != None else 0,
